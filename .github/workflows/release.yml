@@ -1,0 +1,75 @@
+name: Create Release (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.0.1)'
+        required: true
+        type: string
+        default: '0.0.1'
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Normalize version tag
+        id: ver
+        shell: pwsh
+        run: |
+          $raw = "${{ inputs.version }}".Trim()
+          $clean = $raw.TrimStart('v', 'V')
+          $tag = "v$clean"
+          "clean=$clean" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Release tag: $tag (version $clean)"
+
+      - name: Setup MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure with CMake + Ninja + Clang
+        shell: pwsh
+        run: |
+          cmake -B build -G Ninja `
+            -DCMAKE_C_COMPILER=clang `
+            -DCMAKE_CXX_COMPILER=clang++ `
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build self-contained recompiler
+        shell: pwsh
+        run: cmake --build build --parallel
+
+      - name: Package release archive
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $dist = "dist\AriaOfSorrowRecomp-$tag-windows-x64"
+          $zipPath = "dist\AriaOfSorrowRecomp-$tag-windows-x64.zip"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "build\recomp-ariaofsorrow.exe" "$dist\"
+          Copy-Item "README.md" "$dist\"
+          Copy-Item "LICENSE" "$dist\"
+          Compress-Archive -Path "$dist\*" -DestinationPath $zipPath -Force
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: AriaOfSorrowRecomp ${{ steps.ver.outputs.tag }}
+          files: dist/AriaOfSorrowRecomp-${{ steps.ver.outputs.tag }}-windows-x64.zip
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true

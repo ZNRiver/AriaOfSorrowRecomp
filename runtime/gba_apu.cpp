@@ -1,22 +1,32 @@
 #include "gba_apu.h"
 #include "gba_bus.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <mmsystem.h>
+#elif defined(__EMSCRIPTEN__) || defined(__linux__)
+#include <SDL2/SDL.h>
+#endif
 
 #include <algorithm>
 #include <cstring>
 
 namespace gba {
 
+#ifdef _WIN32
 struct GbaApu::WaveBuf {
     WAVEHDR hdr{};
     std::array<int16_t, kSamplesPerBuffer * 2> data{};
     bool prepared = false;
 };
+#else
+struct GbaApu::WaveBuf {
+    uint32_t sdlAudioDev = 0;
+};
+#endif
 
 GbaApu::GbaApu() {
     staging_.reserve(kSamplesPerBuffer * 8);
@@ -27,6 +37,7 @@ GbaApu::~GbaApu() {
 }
 
 bool GbaApu::InitAudioOutput() {
+#ifdef _WIN32
     if (hWaveOut_) return true;
 
     WAVEFORMATEX wfx{};
@@ -62,9 +73,26 @@ bool GbaApu::InitAudioOutput() {
         nextWaveBuf_ = (nextWaveBuf_ + 1) % kNumWaveBuffers;
     }
     return true;
+#elif defined(__EMSCRIPTEN__) || defined(__linux__)
+    if (waveBufs_) return true;
+    SDL_AudioSpec want{}, have{};
+    want.freq = kSampleRate;
+    want.format = AUDIO_S16SYS;
+    want.channels = 2;
+    want.samples = kSamplesPerBuffer;
+    SDL_AudioDeviceID dev = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
+    if (dev == 0) return false;
+    waveBufs_ = new WaveBuf{};
+    waveBufs_->sdlAudioDev = dev;
+    SDL_PauseAudioDevice(dev, 0);
+    return true;
+#else
+    return false;
+#endif
 }
 
 void GbaApu::ShutdownAudioOutput() {
+#ifdef _WIN32
     if (!hWaveOut_) return;
     HWAVEOUT hwo = reinterpret_cast<HWAVEOUT>(hWaveOut_);
     waveOutReset(hwo);
@@ -79,6 +107,13 @@ void GbaApu::ShutdownAudioOutput() {
     }
     waveOutClose(hwo);
     hWaveOut_ = nullptr;
+#elif defined(__EMSCRIPTEN__) || defined(__linux__)
+    if (waveBufs_) {
+        if (waveBufs_->sdlAudioDev) SDL_CloseAudioDevice(waveBufs_->sdlAudioDev);
+        delete waveBufs_;
+        waveBufs_ = nullptr;
+    }
+#endif
 }
 
 void GbaApu::Reset() {
@@ -93,6 +128,7 @@ void GbaApu::Reset() {
 }
 
 void GbaApu::OnPaused() {
+#ifdef _WIN32
     // Keep waveOut fed with gentle silence while paused so resuming never clicks
     if (!hWaveOut_ || !waveBufs_) return;
     int queued = CountQueuedBuffers();
@@ -112,6 +148,14 @@ void GbaApu::OnPaused() {
             nextWaveBuf_ = (nextWaveBuf_ + 1) % kNumWaveBuffers;
         }
     }
+#elif defined(__EMSCRIPTEN__) || defined(__linux__)
+    if (waveBufs_ && waveBufs_->sdlAudioDev) {
+        if (SDL_GetQueuedAudioSize(waveBufs_->sdlAudioDev) < kSamplesPerBuffer * 4) {
+            std::array<int16_t, kSamplesPerBuffer * 2> silence{};
+            SDL_QueueAudio(waveBufs_->sdlAudioDev, silence.data(), static_cast<Uint32>(silence.size() * sizeof(int16_t)));
+        }
+    }
+#endif
 }
 
 void GbaApu::SetVolume(float volume, bool muted) {
@@ -156,6 +200,7 @@ void GbaApu::OnTimerOverflow(GbaBus& bus, int timerId) {
 }
 
 int GbaApu::CountQueuedBuffers() const {
+#ifdef _WIN32
     if (!waveBufs_) return 0;
     int q = 0;
     for (int i = 0; i < kNumWaveBuffers; ++i) {
@@ -164,6 +209,13 @@ int GbaApu::CountQueuedBuffers() const {
         }
     }
     return q;
+#elif defined(__EMSCRIPTEN__) || defined(__linux__)
+    if (!waveBufs_ || !waveBufs_->sdlAudioDev) return 0;
+    Uint32 bytes = SDL_GetQueuedAudioSize(waveBufs_->sdlAudioDev);
+    return static_cast<int>(bytes / (kSamplesPerBuffer * 2 * sizeof(int16_t)));
+#else
+    return 0;
+#endif
 }
 
 void GbaApu::StepCycles(GbaBus& bus, uint32_t cycles) {
@@ -222,14 +274,12 @@ void GbaApu::StepCycles(GbaBus& bus, uint32_t cycles) {
 }
 
 void GbaApu::PumpAudio() {
+#ifdef _WIN32
     if (!hWaveOut_ || !waveBufs_) {
         if (staging_.size() > kSamplesPerBuffer * 8) staging_.clear();
         return;
     }
 
-    // Smooth Dynamic Rate Control (DRC):
-    // Gently steer queued buffer count toward kTargetQueuedBuffers (4) by adjusting sample rate +-1.5%
-    // This completely eliminates buffer underruns and overruns ("tec" clicks) on 59.73Hz vs 60Hz monitors!
     int queued = CountQueuedBuffers();
     double error = static_cast<double>(queued - kTargetQueuedBuffers);
     double targetScale = 1.0 + std::clamp(error * 0.004, -0.015, 0.015);
@@ -239,7 +289,6 @@ void GbaApu::PumpAudio() {
     while (staging_.size() >= static_cast<size_t>(kSamplesPerBuffer * 2)) {
         WaveBuf& wb = waveBufs_[nextWaveBuf_];
         if (wb.prepared && !(wb.hdr.dwFlags & WHDR_DONE)) {
-            // Only drop during Fast-Forward when all 10 buffers (~116ms) are completely saturated
             if (staging_.size() > static_cast<size_t>(kSamplesPerBuffer * 6)) {
                 staging_.erase(staging_.begin(), staging_.begin() + kSamplesPerBuffer * 2);
             }
@@ -259,6 +308,27 @@ void GbaApu::PumpAudio() {
         waveOutWrite(hwo, &wb.hdr, sizeof(WAVEHDR));
         nextWaveBuf_ = (nextWaveBuf_ + 1) % kNumWaveBuffers;
     }
+#elif defined(__EMSCRIPTEN__) || defined(__linux__)
+    if (!waveBufs_ || !waveBufs_->sdlAudioDev) {
+        if (staging_.size() > kSamplesPerBuffer * 8) staging_.clear();
+        return;
+    }
+
+    int queued = CountQueuedBuffers();
+    double error = static_cast<double>(queued - kTargetQueuedBuffers);
+    double targetScale = 1.0 + std::clamp(error * 0.004, -0.015, 0.015);
+    drcRateScale_ = drcRateScale_ * 0.85 + targetScale * 0.15;
+
+    if (queued < kNumWaveBuffers && !staging_.empty()) {
+        SDL_QueueAudio(waveBufs_->sdlAudioDev, staging_.data(),
+                       static_cast<Uint32>(staging_.size() * sizeof(int16_t)));
+        staging_.clear();
+    } else if (staging_.size() > static_cast<size_t>(kSamplesPerBuffer * 6)) {
+        staging_.clear();
+    }
+#else
+    if (staging_.size() > kSamplesPerBuffer * 8) staging_.clear();
+#endif
 }
 
 } // namespace gba

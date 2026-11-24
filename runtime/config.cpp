@@ -1,9 +1,18 @@
 #include "config.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#include <SDL2/SDL.h>
+#elif defined(__linux__)
+#include <SDL2/SDL.h>
+#include <cstdlib>
+#include <cstring>
+#endif
 
 #include <fstream>
 #include <sstream>
@@ -17,6 +26,7 @@ AppConfig::AppConfig() {
 }
 
 void AppConfig::ResetDefaultBinds() {
+#ifdef _WIN32
     keyBinds[static_cast<int>(BindAction::Up)]          = VK_UP;
     keyBinds[static_cast<int>(BindAction::Down)]        = VK_DOWN;
     keyBinds[static_cast<int>(BindAction::Left)]        = VK_LEFT;
@@ -33,6 +43,24 @@ void AppConfig::ResetDefaultBinds() {
     keyBinds[static_cast<int>(BindAction::QuickLoad)]   = VK_F7;
     keyBinds[static_cast<int>(BindAction::Reset)]       = VK_F8;
     keyBinds[static_cast<int>(BindAction::Fullscreen)]  = VK_F11;
+#elif defined(__EMSCRIPTEN__) || defined(__linux__)
+    keyBinds[static_cast<int>(BindAction::Up)]          = SDL_SCANCODE_UP;
+    keyBinds[static_cast<int>(BindAction::Down)]        = SDL_SCANCODE_DOWN;
+    keyBinds[static_cast<int>(BindAction::Left)]        = SDL_SCANCODE_LEFT;
+    keyBinds[static_cast<int>(BindAction::Right)]       = SDL_SCANCODE_RIGHT;
+    keyBinds[static_cast<int>(BindAction::A)]           = SDL_SCANCODE_X;
+    keyBinds[static_cast<int>(BindAction::B)]           = SDL_SCANCODE_Z;
+    keyBinds[static_cast<int>(BindAction::L)]           = SDL_SCANCODE_A;
+    keyBinds[static_cast<int>(BindAction::R)]           = SDL_SCANCODE_S;
+    keyBinds[static_cast<int>(BindAction::Start)]       = SDL_SCANCODE_RETURN;
+    keyBinds[static_cast<int>(BindAction::Select)]      = SDL_SCANCODE_BACKSPACE;
+    keyBinds[static_cast<int>(BindAction::MenuToggle)]  = SDL_SCANCODE_F10;
+    keyBinds[static_cast<int>(BindAction::FastForward)] = SDL_SCANCODE_TAB;
+    keyBinds[static_cast<int>(BindAction::QuickSave)]   = SDL_SCANCODE_F5;
+    keyBinds[static_cast<int>(BindAction::QuickLoad)]   = SDL_SCANCODE_F7;
+    keyBinds[static_cast<int>(BindAction::Reset)]       = SDL_SCANCODE_F8;
+    keyBinds[static_cast<int>(BindAction::Fullscreen)]  = SDL_SCANCODE_F11;
+#endif
 }
 
 void AppConfig::ResetDefaultPadBinds() {
@@ -74,11 +102,33 @@ void AppConfig::ResetAllDefaults() {
 
 UiLanguage ResolveEffectiveLanguage(UiLanguage pref) {
     if (pref != UiLanguage::Auto) return pref;
+#ifdef _WIN32
     LANGID langId = GetUserDefaultUILanguage();
     WORD primary = PRIMARYLANGID(langId);
     if (primary == LANG_PORTUGUESE) return UiLanguage::Portuguese;
     if (primary == LANG_SPANISH)    return UiLanguage::Spanish;
     return UiLanguage::English;
+#elif defined(__EMSCRIPTEN__)
+    int code = EM_ASM_INT({
+        var lang = (navigator.language || 'en').toLowerCase();
+        if (lang.indexOf('pt') === 0) return 2;
+        if (lang.indexOf('es') === 0) return 3;
+        return 1;
+    });
+    if (code == 2) return UiLanguage::Portuguese;
+    if (code == 3) return UiLanguage::Spanish;
+    return UiLanguage::English;
+#elif defined(__linux__)
+    const char* env = std::getenv("LC_ALL");
+    if (!env || !env[0]) env = std::getenv("LANG");
+    if (env) {
+        if (std::strncmp(env, "pt", 2) == 0 || std::strncmp(env, "PT", 2) == 0) return UiLanguage::Portuguese;
+        if (std::strncmp(env, "es", 2) == 0 || std::strncmp(env, "ES", 2) == 0) return UiLanguage::Spanish;
+    }
+    return UiLanguage::English;
+#else
+    return UiLanguage::English;
+#endif
 }
 
 static const char* kActionKeys[static_cast<int>(BindAction::Count)] = {
@@ -240,6 +290,7 @@ const char* GetBindActionName(BindAction action, UiLanguage lang) {
 
 std::string GetVkName(int vk) {
     if (vk <= 0) return "---";
+#ifdef _WIN32
     switch (vk) {
         case VK_UP: return "Up Arrow";
         case VK_DOWN: return "Down Arrow";
@@ -278,6 +329,12 @@ std::string GetVkName(int vk) {
     char hex[16];
     snprintf(hex, sizeof(hex), "VK_0x%02X", vk);
     return hex;
+#elif defined(__EMSCRIPTEN__) || defined(__linux__)
+    const char* name = SDL_GetScancodeName(static_cast<SDL_Scancode>(vk));
+    return (name && name[0]) ? std::string(name) : ("Key_" + std::to_string(vk));
+#else
+    return "Key_" + std::to_string(vk);
+#endif
 }
 
 const char* GetPadButtonName(int padBtn, UiLanguage lang) {

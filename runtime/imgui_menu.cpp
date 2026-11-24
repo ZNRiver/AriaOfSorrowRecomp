@@ -1,10 +1,14 @@
 #include "imgui_menu.h"
 #include "imgui.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__EMSCRIPTEN__) || defined(__linux__)
+#include <SDL2/SDL.h>
+#endif
 
 #include <cstdio>
 
@@ -176,11 +180,19 @@ void ImGuiMenu::Toggle() {
 
 bool ImGuiMenu::HandleKeyForRebind(int vk) {
     if (!IsCapturingBind()) return false;
+#ifdef _WIN32
     if (vk == VK_ESCAPE) {
         waitingForKeyIdx = -1;
         waitingForPadIdx = -1;
         return true;
     }
+#elif defined(__EMSCRIPTEN__) || defined(__linux__)
+    if (vk == SDL_SCANCODE_ESCAPE) {
+        waitingForKeyIdx = -1;
+        waitingForPadIdx = -1;
+        return true;
+    }
+#endif
     return false;
 }
 
@@ -193,6 +205,7 @@ MenuActions ImGuiMenu::Render(AppConfig& cfg, const RecompRomInfo& romInfo, cons
 
     // Handle active keyboard key capture
     if (waitingForKeyIdx >= 0) {
+#ifdef _WIN32
         for (int vk = 0x08; vk <= 0xFE; ++vk) {
             if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) continue;
             if (GetAsyncKeyState(vk) & 0x8000) {
@@ -207,13 +220,40 @@ MenuActions ImGuiMenu::Render(AppConfig& cfg, const RecompRomInfo& romInfo, cons
                 break;
             }
         }
+#elif defined(__EMSCRIPTEN__) || defined(__linux__)
+        int numKeys = 0;
+        const Uint8* ks = SDL_GetKeyboardState(&numKeys);
+        for (int sc = 4; sc < numKeys; ++sc) {
+            if (ks[sc]) {
+                if (sc == SDL_SCANCODE_DELETE) {
+                    cfg.keyBinds[waitingForKeyIdx] = 0;
+                    actions.requestSaveConfig = true;
+                } else if (sc != SDL_SCANCODE_ESCAPE) {
+                    cfg.keyBinds[waitingForKeyIdx] = sc;
+                    actions.requestSaveConfig = true;
+                }
+                waitingForKeyIdx = -1;
+                break;
+            }
+        }
+#endif
     }
 
     // Handle active gamepad button capture
     if (waitingForPadIdx >= 0) {
-        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+#ifdef _WIN32
+        bool escDown = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        bool delDown = (GetAsyncKeyState(VK_DELETE) & 0x8000) != 0;
+#elif defined(__EMSCRIPTEN__) || defined(__linux__)
+        const Uint8* ks = SDL_GetKeyboardState(nullptr);
+        bool escDown = ks[SDL_SCANCODE_ESCAPE] != 0;
+        bool delDown = ks[SDL_SCANCODE_DELETE] != 0;
+#else
+        bool escDown = false, delDown = false;
+#endif
+        if (escDown) {
             waitingForPadIdx = -1;
-        } else if (GetAsyncKeyState(VK_DELETE) & 0x8000) {
+        } else if (delDown) {
             cfg.padBinds[waitingForPadIdx] = static_cast<int>(PadButton::None);
             actions.requestSaveConfig = true;
             waitingForPadIdx = -1;

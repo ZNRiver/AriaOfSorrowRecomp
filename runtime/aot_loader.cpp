@@ -2,10 +2,16 @@
 #include "gba_cpu.h"
 #include "gba_bus.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#include <limits.h>
+#endif
 
 #include <cstring>
 #include <fstream>
@@ -80,10 +86,19 @@ const RuntimeHelpers* GetRuntimeHelpers() {
 }
 
 bool LoadEmbeddedAotBundle() {
+#ifdef _WIN32
     wchar_t exePath[MAX_PATH] = {};
     if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0) return false;
-
     std::ifstream in(exePath, std::ios::binary | std::ios::ate);
+#elif defined(__linux__)
+    char exePath[PATH_MAX] = {};
+    ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (len <= 0) return false;
+    exePath[len] = '\0';
+    std::ifstream in(exePath, std::ios::binary | std::ios::ate);
+#else
+    return false;
+#endif
     if (!in.is_open()) return false;
 
     std::streamsize fileSize = in.tellg();
@@ -110,6 +125,7 @@ bool LoadEmbeddedAotBundle() {
 
     // Allocate executable memory for the statically recompiled native x86_64 code blob!
     if (hdr.codeBlobSize > 0) {
+#ifdef _WIN32
         g_execCodeMem = VirtualAlloc(nullptr, hdr.codeBlobSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!g_execCodeMem) return false;
         g_execCodeSize = hdr.codeBlobSize;
@@ -123,6 +139,24 @@ bool LoadEmbeddedAotBundle() {
             return false;
         }
         FlushInstructionCache(GetCurrentProcess(), g_execCodeMem, hdr.codeBlobSize);
+#elif defined(__linux__)
+        g_execCodeMem = mmap(nullptr, hdr.codeBlobSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (g_execCodeMem == MAP_FAILED) {
+            g_execCodeMem = nullptr;
+            return false;
+        }
+        g_execCodeSize = hdr.codeBlobSize;
+        if (!in.read(reinterpret_cast<char*>(g_execCodeMem), hdr.codeBlobSize)) {
+            UnloadEmbeddedAotBundle();
+            return false;
+        }
+        if (mprotect(g_execCodeMem, hdr.codeBlobSize, PROT_READ | PROT_EXEC) != 0) {
+            UnloadEmbeddedAotBundle();
+            return false;
+        }
+        __builtin___clear_cache(static_cast<char*>(g_execCodeMem),
+                                static_cast<char*>(g_execCodeMem) + hdr.codeBlobSize);
+#endif
     }
 
     // Read embedded GBA ROM bytes
@@ -164,7 +198,11 @@ bool LoadEmbeddedAotBundle() {
 
 void UnloadEmbeddedAotBundle() {
     if (g_execCodeMem) {
+#ifdef _WIN32
         VirtualFree(g_execCodeMem, 0, MEM_RELEASE);
+#elif defined(__linux__)
+        munmap(g_execCodeMem, g_execCodeSize);
+#endif
         g_execCodeMem = nullptr;
         g_execCodeSize = 0;
     }

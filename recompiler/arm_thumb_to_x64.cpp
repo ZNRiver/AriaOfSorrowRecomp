@@ -12,6 +12,21 @@ namespace {
 
 using Reg = X64Emitter::Reg64;
 
+struct AbiRegs {
+    Reg arg0;
+    Reg arg1;
+    Reg arg2;
+    Reg arg3;
+    uint8_t shadowBytes;
+};
+
+constexpr AbiRegs GetAbiRegs(X64Abi abi) {
+    if (abi == X64Abi::SysV64) {
+        return { Reg::RDI, Reg::RSI, Reg::RDX, Reg::RCX, 0x00 };
+    }
+    return { Reg::RCX, Reg::RDX, Reg::R8, Reg::R9, 0x20 };
+}
+
 inline int32_t SignExt(uint32_t v, int bits) {
     uint32_t s = 32u - static_cast<uint32_t>(bits);
     return static_cast<int32_t>(v << s) >> s;
@@ -25,7 +40,6 @@ inline uint32_t RegOff(uint32_t gbaReg) {
     return gba::CPU_OFF_R + gbaReg * 4u;
 }
 
-// Helper offsets in gba::RuntimeHelpers
 #define HOFF(field) static_cast<uint32_t>(offsetof(gba::RuntimeHelpers, field))
 
 struct PatchRef {
@@ -36,28 +50,41 @@ struct PatchRef {
 void CompileFunction(
     X64Emitter& e,
     const RomAnalyzer& analyzer,
-    const DiscoveredFunction& fn
+    const DiscoveredFunction& fn,
+    X64Abi abi
 ) {
     e.Align16();
+    const AbiRegs A = GetAbiRegs(abi);
 
-    // Windows x64 ABI prologue:
-    // On entry rsp % 16 == 8. Push 5 regs (40 bytes) -> rsp % 16 == 0. Sub 0x20 shadow -> rsp % 16 == 0.
+    // Prologue:
+    // On entry rsp % 16 == 8. Push 5 callee-saved regs (RBX, RBP, R12, R13, R14 = 40 bytes) -> rsp % 16 == 0!
+    // Win64 also reserves 0x20 bytes of shadow space (still 16-byte aligned).
     e.Push(Reg::RBX);
     e.Push(Reg::RBP);
-    e.Push(Reg::RSI);
-    e.Push(Reg::RDI);
     e.Push(Reg::R12);
-    e.SubRspImm8(0x20);
-    e.Mov64(Reg::RBX, Reg::RCX); // rbx = GbaCpu*
-    e.Mov64(Reg::R12, Reg::RDX); // r12 = const RuntimeHelpers*
+    e.Push(Reg::R13);
+    e.Push(Reg::R14);
+    if (A.shadowBytes) e.SubRspImm8(A.shadowBytes);
+    e.Mov64(Reg::RBX, A.arg0); // rbx = GbaCpu*
+    e.Mov64(Reg::R12, A.arg1); // r12 = const RuntimeHelpers*
 
     std::unordered_map<uint32_t, size_t> labelPos;
     std::vector<PatchRef> labelPatches;
     std::vector<size_t> returnTruePatches;
 
+    auto emitEpilogue = [&](uint32_t retVal) {
+        e.Mov32Imm(Reg::RAX, retVal);
+        if (A.shadowBytes) e.AddRspImm8(A.shadowBytes);
+        e.Pop(Reg::R14);
+        e.Pop(Reg::R13);
+        e.Pop(Reg::R12);
+        e.Pop(Reg::RBP);
+        e.Pop(Reg::RBX);
+        e.Ret();
+    };
+
     // Entry dispatch: load cpu->r[15] into eax and jump to matching instruction label
     e.Mov32FromRbx(Reg::RAX, RegOff(15));
-    // Fast-path check for entryAddr first (most frequent case)
     e.CmpEaxImm32(fn.entryAddr);
     labelPatches.push_back({ e.JeRel32(), fn.entryAddr });
     for (uint32_t addr : fn.insnAddrs) {
@@ -67,14 +94,7 @@ void CompileFunction(
     }
 
     // Default: address not in this function -> return false (al = 0)
-    e.Mov32Imm(Reg::RAX, 0);
-    e.AddRspImm8(0x20);
-    e.Pop(Reg::R12);
-    e.Pop(Reg::RDI);
-    e.Pop(Reg::RSI);
-    e.Pop(Reg::RBP);
-    e.Pop(Reg::RBX);
-    e.Ret();
+    emitEpilogue(0);
 
     auto emitReturnTrue = [&]() {
         returnTruePatches.push_back(e.JmpRel32());
@@ -82,7 +102,6 @@ void CompileFunction(
 
     auto emitJumpTarget = [&](uint32_t target) {
         if (HasLocalAddr(fn.insnAddrs, target)) {
-            // Check if cycles >= nextEventCycles; if so, save target to r[15] and return true
             e.Mov64FromRbx(Reg::RAX, gba::CPU_OFF_CYCLES);
             e.CmpRaxRbxMem64(gba::CPU_OFF_NEXT_EVENT);
             size_t jaeExit = e.JaeRel32();
@@ -96,7 +115,6 @@ void CompileFunction(
         }
     };
 
-    // Emit native x86_64 code for each instruction in the function
     for (uint32_t pc : fn.insnAddrs) {
         labelPos[pc] = e.Pos();
         e.Add64RbxImm8(gba::CPU_OFF_CYCLES, 2);
@@ -120,24 +138,21 @@ void CompileFunction(
             size_t skipCondPatch = 0;
             bool hasCond = (cond != 0xE);
             if (hasCond) {
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32Imm(Reg::RDX, cond);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32Imm(A.arg1, cond);
                 e.CallHelper(HOFF(checkCond));
                 e.TestEaxEax();
                 skipCondPatch = e.JeRel32();
             }
 
-            // 1. BX Rn
-            if ((ins & 0x0FFFFFF0u) == 0x012FFF10u) {
+            if ((ins & 0x0FFFFFF0u) == 0x012FFF10u) { // BX Rn
                 uint32_t rn = ins & 0xFu;
-                e.Mov64(Reg::RCX, Reg::RBX);
-                if (rn == 15) e.Mov32Imm(Reg::RDX, pcVal);
-                else          e.Mov32FromRbx(Reg::RDX, RegOff(rn));
+                e.Mov64(A.arg0, Reg::RBX);
+                if (rn == 15) e.Mov32Imm(A.arg1, pcVal);
+                else          e.Mov32FromRbx(A.arg1, RegOff(rn));
                 e.CallHelper(HOFF(branchExchange));
                 emitReturnTrue();
-            }
-            // 2. B / BL
-            else if ((ins & 0x0E000000u) == 0x0A000000u) {
+            } else if ((ins & 0x0E000000u) == 0x0A000000u) { // B / BL
                 int32_t off = SignExt(ins & 0x00FFFFFFu, 24) << 2;
                 uint32_t target = (pcVal + static_cast<uint32_t>(off)) & ~3u;
                 if (ins & (1u << 24)) {
@@ -147,25 +162,21 @@ void CompileFunction(
                 } else {
                     emitJumpTarget(target);
                 }
-            }
-            // 3. SWI
-            else if ((ins & 0x0F000000u) == 0x0F000000u) {
+            } else if ((ins & 0x0F000000u) == 0x0F000000u) { // SWI
                 uint8_t num = static_cast<uint8_t>((ins >> 16) & 0xFFu);
                 e.Mov32ImmToRbx(RegOff(15), nextPc);
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32Imm(Reg::RDX, num);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32Imm(A.arg1, num);
                 e.CallHelper(HOFF(execSwi));
                 e.CmpByteRbxZero(gba::CPU_OFF_HALTED);
                 returnTruePatches.push_back(e.JneRel32());
                 e.Mov32FromRbx(Reg::RAX, RegOff(15));
                 e.CmpEaxImm32(nextPc);
                 returnTruePatches.push_back(e.JneRel32());
-            }
-            // 4. All other ARM instructions via exact helper (keeping native branch/loop control flow)
-            else {
+            } else {
                 e.Mov32ImmToRbx(RegOff(15), nextPc);
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32Imm(Reg::RDX, ins);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32Imm(A.arg1, ins);
                 e.CallHelper(HOFF(execArm));
                 e.Mov32FromRbx(Reg::RAX, RegOff(15));
                 e.CmpEaxImm32(nextPc);
@@ -193,10 +204,10 @@ void CompileFunction(
                 uint32_t imm = (ins >> 6) & 0x1Fu;
                 uint32_t rs = (ins >> 3) & 7u;
                 uint32_t rd = ins & 7u;
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32FromRbx(Reg::RDX, RegOff(rs));
-                e.Mov32Imm(Reg::R8, op);
-                e.Mov32Imm(Reg::R9, imm);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32FromRbx(A.arg1, RegOff(rs));
+                e.Mov32Imm(A.arg2, op);
+                e.Mov32Imm(A.arg3, imm);
                 e.CallHelper(HOFF(shiftImmSetFlags));
                 e.Mov32ToRbx(RegOff(rd), Reg::RAX);
             }
@@ -207,11 +218,11 @@ void CompileFunction(
                 uint32_t rnOrImm = (ins >> 6) & 7u;
                 uint32_t rs = (ins >> 3) & 7u;
                 uint32_t rd = ins & 7u;
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32FromRbx(Reg::RDX, RegOff(rs));
-                if (imm) e.Mov32Imm(Reg::R8, rnOrImm);
-                else     e.Mov32FromRbx(Reg::R8, RegOff(rnOrImm));
-                e.Mov32Imm(Reg::R9, 1);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32FromRbx(A.arg1, RegOff(rs));
+                if (imm) e.Mov32Imm(A.arg2, rnOrImm);
+                else     e.Mov32FromRbx(A.arg2, RegOff(rnOrImm));
+                e.Mov32Imm(A.arg3, 1);
                 e.CallHelper(sub ? HOFF(sub) : HOFF(add));
                 e.Mov32ToRbx(RegOff(rd), Reg::RAX);
             }
@@ -222,20 +233,20 @@ void CompileFunction(
                 uint32_t imm = ins & 0xFFu;
                 if (op == 0) {
                     e.Mov32ImmToRbx(RegOff(rd), imm);
-                    e.Mov64(Reg::RCX, Reg::RBX);
-                    e.Mov32Imm(Reg::RDX, imm);
+                    e.Mov64(A.arg0, Reg::RBX);
+                    e.Mov32Imm(A.arg1, imm);
                     e.CallHelper(HOFF(setNZ));
                 } else if (op == 1) {
-                    e.Mov64(Reg::RCX, Reg::RBX);
-                    e.Mov32FromRbx(Reg::RDX, RegOff(rd));
-                    e.Mov32Imm(Reg::R8, imm);
-                    e.Mov32Imm(Reg::R9, 1);
+                    e.Mov64(A.arg0, Reg::RBX);
+                    e.Mov32FromRbx(A.arg1, RegOff(rd));
+                    e.Mov32Imm(A.arg2, imm);
+                    e.Mov32Imm(A.arg3, 1);
                     e.CallHelper(HOFF(sub));
                 } else {
-                    e.Mov64(Reg::RCX, Reg::RBX);
-                    e.Mov32FromRbx(Reg::RDX, RegOff(rd));
-                    e.Mov32Imm(Reg::R8, imm);
-                    e.Mov32Imm(Reg::R9, 1);
+                    e.Mov64(A.arg0, Reg::RBX);
+                    e.Mov32FromRbx(A.arg1, RegOff(rd));
+                    e.Mov32Imm(A.arg2, imm);
+                    e.Mov32Imm(A.arg3, 1);
                     e.CallHelper(op == 2 ? HOFF(add) : HOFF(sub));
                     e.Mov32ToRbx(RegOff(rd), Reg::RAX);
                 }
@@ -247,93 +258,91 @@ void CompileFunction(
                 uint32_t rd = ins & 7u;
                 switch (op) {
                     case 0x0: // AND
-                        e.Mov32FromRbx(Reg::RDX, RegOff(rd));
+                        e.Mov32FromRbx(A.arg1, RegOff(rd));
                         e.Mov32FromRbx(Reg::RAX, RegOff(rs));
-                        e.And32(Reg::RDX, Reg::RAX);
-                        e.Mov32ToRbx(RegOff(rd), Reg::RDX);
-                        e.Mov64(Reg::RCX, Reg::RBX);
+                        e.And32(A.arg1, Reg::RAX);
+                        e.Mov32ToRbx(RegOff(rd), A.arg1);
+                        e.Mov64(A.arg0, Reg::RBX);
                         e.CallHelper(HOFF(setNZ));
                         break;
                     case 0x1: // EOR
-                        e.Mov32FromRbx(Reg::RDX, RegOff(rd));
+                        e.Mov32FromRbx(A.arg1, RegOff(rd));
                         e.Mov32FromRbx(Reg::RAX, RegOff(rs));
-                        e.Xor32(Reg::RDX, Reg::RAX);
-                        e.Mov32ToRbx(RegOff(rd), Reg::RDX);
-                        e.Mov64(Reg::RCX, Reg::RBX);
+                        e.Xor32(A.arg1, Reg::RAX);
+                        e.Mov32ToRbx(RegOff(rd), A.arg1);
+                        e.Mov64(A.arg0, Reg::RBX);
                         e.CallHelper(HOFF(setNZ));
                         break;
-                    case 0x2: case 0x3: case 0x4: case 0x7: { // LSL / LSR / ASR / ROR
+                    case 0x2: case 0x3: case 0x4: case 0x7: {
                         uint32_t st = (op == 0x2) ? 0u : (op == 0x3) ? 1u : (op == 0x4) ? 2u : 3u;
-                        e.Mov64(Reg::RCX, Reg::RBX);
-                        e.Mov32FromRbx(Reg::RDX, RegOff(rd));
-                        e.Mov32Imm(Reg::R8, st);
-                        e.Mov32FromRbx(Reg::R9, RegOff(rs));
+                        e.Mov64(A.arg0, Reg::RBX);
+                        e.Mov32FromRbx(A.arg1, RegOff(rd));
+                        e.Mov32Imm(A.arg2, st);
+                        e.Mov32FromRbx(A.arg3, RegOff(rs));
                         e.CallHelper(HOFF(shiftRegSetFlags));
                         e.Mov32ToRbx(RegOff(rd), Reg::RAX);
                         break;
                     }
-                    case 0x5: // ADC
-                    case 0x6: // SBC
-                        e.Mov64(Reg::RCX, Reg::RBX);
-                        e.Mov32FromRbx(Reg::RDX, RegOff(rd));
-                        e.Mov32FromRbx(Reg::R8, RegOff(rs));
-                        e.Mov32Imm(Reg::R9, 1);
+                    case 0x5: case 0x6:
+                        e.Mov64(A.arg0, Reg::RBX);
+                        e.Mov32FromRbx(A.arg1, RegOff(rd));
+                        e.Mov32FromRbx(A.arg2, RegOff(rs));
+                        e.Mov32Imm(A.arg3, 1);
                         e.CallHelper(op == 0x5 ? HOFF(adc) : HOFF(sbc));
                         e.Mov32ToRbx(RegOff(rd), Reg::RAX);
                         break;
                     case 0x8: // TST
-                        e.Mov32FromRbx(Reg::RDX, RegOff(rd));
+                        e.Mov32FromRbx(A.arg1, RegOff(rd));
                         e.Mov32FromRbx(Reg::RAX, RegOff(rs));
-                        e.And32(Reg::RDX, Reg::RAX);
-                        e.Mov64(Reg::RCX, Reg::RBX);
+                        e.And32(A.arg1, Reg::RAX);
+                        e.Mov64(A.arg0, Reg::RBX);
                         e.CallHelper(HOFF(setNZ));
                         break;
                     case 0x9: // NEG
-                        e.Mov64(Reg::RCX, Reg::RBX);
-                        e.Mov32Imm(Reg::RDX, 0);
-                        e.Mov32FromRbx(Reg::R8, RegOff(rs));
-                        e.Mov32Imm(Reg::R9, 1);
+                        e.Mov64(A.arg0, Reg::RBX);
+                        e.Mov32Imm(A.arg1, 0);
+                        e.Mov32FromRbx(A.arg2, RegOff(rs));
+                        e.Mov32Imm(A.arg3, 1);
                         e.CallHelper(HOFF(sub));
                         e.Mov32ToRbx(RegOff(rd), Reg::RAX);
                         break;
-                    case 0xA: // CMP
-                    case 0xB: // CMN
-                        e.Mov64(Reg::RCX, Reg::RBX);
-                        e.Mov32FromRbx(Reg::RDX, RegOff(rd));
-                        e.Mov32FromRbx(Reg::R8, RegOff(rs));
-                        e.Mov32Imm(Reg::R9, 1);
+                    case 0xA: case 0xB:
+                        e.Mov64(A.arg0, Reg::RBX);
+                        e.Mov32FromRbx(A.arg1, RegOff(rd));
+                        e.Mov32FromRbx(A.arg2, RegOff(rs));
+                        e.Mov32Imm(A.arg3, 1);
                         e.CallHelper(op == 0xA ? HOFF(sub) : HOFF(add));
                         break;
                     case 0xC: // ORR
-                        e.Mov32FromRbx(Reg::RDX, RegOff(rd));
+                        e.Mov32FromRbx(A.arg1, RegOff(rd));
                         e.Mov32FromRbx(Reg::RAX, RegOff(rs));
-                        e.Or32(Reg::RDX, Reg::RAX);
-                        e.Mov32ToRbx(RegOff(rd), Reg::RDX);
-                        e.Mov64(Reg::RCX, Reg::RBX);
+                        e.Or32(A.arg1, Reg::RAX);
+                        e.Mov32ToRbx(RegOff(rd), A.arg1);
+                        e.Mov64(A.arg0, Reg::RBX);
                         e.CallHelper(HOFF(setNZ));
                         break;
                     case 0xD: // MUL
-                        e.Mov32FromRbx(Reg::RDX, RegOff(rd));
+                        e.Mov32FromRbx(A.arg1, RegOff(rd));
                         e.Mov32FromRbx(Reg::RAX, RegOff(rs));
-                        e.Imul32(Reg::RDX, Reg::RAX);
-                        e.Mov32ToRbx(RegOff(rd), Reg::RDX);
-                        e.Mov64(Reg::RCX, Reg::RBX);
+                        e.Imul32(A.arg1, Reg::RAX);
+                        e.Mov32ToRbx(RegOff(rd), A.arg1);
+                        e.Mov64(A.arg0, Reg::RBX);
                         e.CallHelper(HOFF(setNZ));
                         break;
                     case 0xE: // BIC
-                        e.Mov32FromRbx(Reg::RDX, RegOff(rd));
+                        e.Mov32FromRbx(A.arg1, RegOff(rd));
                         e.Mov32FromRbx(Reg::RAX, RegOff(rs));
                         e.Not32(Reg::RAX);
-                        e.And32(Reg::RDX, Reg::RAX);
-                        e.Mov32ToRbx(RegOff(rd), Reg::RDX);
-                        e.Mov64(Reg::RCX, Reg::RBX);
+                        e.And32(A.arg1, Reg::RAX);
+                        e.Mov32ToRbx(RegOff(rd), A.arg1);
+                        e.Mov64(A.arg0, Reg::RBX);
                         e.CallHelper(HOFF(setNZ));
                         break;
                     case 0xF: // MVN
-                        e.Mov32FromRbx(Reg::RDX, RegOff(rs));
-                        e.Not32(Reg::RDX);
-                        e.Mov32ToRbx(RegOff(rd), Reg::RDX);
-                        e.Mov64(Reg::RCX, Reg::RBX);
+                        e.Mov32FromRbx(A.arg1, RegOff(rs));
+                        e.Not32(A.arg1);
+                        e.Mov32ToRbx(RegOff(rd), A.arg1);
+                        e.Mov64(A.arg0, Reg::RBX);
                         e.CallHelper(HOFF(setNZ));
                         break;
                 }
@@ -351,8 +360,8 @@ void CompileFunction(
 
                 if (op == 0) { // ADD
                     loadHiReg(Reg::RAX, rd);
-                    loadHiReg(Reg::RDX, rs);
-                    e.Add32(Reg::RAX, Reg::RDX);
+                    loadHiReg(A.arg1, rs);
+                    e.Add32(Reg::RAX, A.arg1);
                     if (rd == 15) {
                         e.And32Imm(Reg::RAX, ~1u);
                         e.Mov32ToRbx(RegOff(15), Reg::RAX);
@@ -362,10 +371,10 @@ void CompileFunction(
                         e.Mov32ToRbx(RegOff(rd), Reg::RAX);
                     }
                 } else if (op == 1) { // CMP
-                    e.Mov64(Reg::RCX, Reg::RBX);
-                    loadHiReg(Reg::RDX, rd);
-                    loadHiReg(Reg::R8, rs);
-                    e.Mov32Imm(Reg::R9, 1);
+                    e.Mov64(A.arg0, Reg::RBX);
+                    loadHiReg(A.arg1, rd);
+                    loadHiReg(A.arg2, rs);
+                    e.Mov32Imm(A.arg3, 1);
                     e.CallHelper(HOFF(sub));
                 } else if (op == 2) { // MOV
                     loadHiReg(Reg::RAX, rs);
@@ -378,8 +387,8 @@ void CompileFunction(
                         e.Mov32ToRbx(RegOff(rd), Reg::RAX);
                     }
                 } else { // BX
-                    e.Mov64(Reg::RCX, Reg::RBX);
-                    loadHiReg(Reg::RDX, rs);
+                    e.Mov64(A.arg0, Reg::RBX);
+                    loadHiReg(A.arg1, rs);
                     e.CallHelper(HOFF(branchExchange));
                     emitReturnTrue();
                     continue;
@@ -389,8 +398,8 @@ void CompileFunction(
             else if ((ins & 0xF800u) == 0x4800u) {
                 uint32_t rd = (ins >> 8) & 7u;
                 uint32_t addr = (pcVal & ~3u) + ((ins & 0xFFu) << 2);
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32Imm(Reg::RDX, addr);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32Imm(A.arg1, addr);
                 e.CallHelper(HOFF(read32));
                 e.Mov32ToRbx(RegOff(rd), Reg::RAX);
             }
@@ -400,12 +409,12 @@ void CompileFunction(
                 uint32_t rb = (ins >> 3) & 7u;
                 uint32_t rd = ins & 7u;
                 uint32_t op = (ins >> 9) & 7u;
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32FromRbx(Reg::RDX, RegOff(rb));
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32FromRbx(A.arg1, RegOff(rb));
                 e.Mov32FromRbx(Reg::RAX, RegOff(ro));
-                e.Add32(Reg::RDX, Reg::RAX);
+                e.Add32(A.arg1, Reg::RAX);
                 if (op <= 2) {
-                    e.Mov32FromRbx(Reg::R8, RegOff(rd));
+                    e.Mov32FromRbx(A.arg2, RegOff(rd));
                     e.CallHelper(op == 0 ? HOFF(write32) : (op == 1 ? HOFF(write16) : HOFF(write8)));
                 } else {
                     uint32_t fnOff = (op == 3) ? HOFF(read8Signed) :
@@ -424,14 +433,14 @@ void CompileFunction(
                 uint32_t rb = (ins >> 3) & 7u;
                 uint32_t rd = ins & 7u;
                 uint32_t off = b ? imm : (imm << 2);
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32FromRbx(Reg::RDX, RegOff(rb));
-                if (off) e.Add32Imm(Reg::RDX, off);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32FromRbx(A.arg1, RegOff(rb));
+                if (off) e.Add32Imm(A.arg1, off);
                 if (l) {
                     e.CallHelper(b ? HOFF(read8) : HOFF(read32Rotated));
                     e.Mov32ToRbx(RegOff(rd), Reg::RAX);
                 } else {
-                    e.Mov32FromRbx(Reg::R8, RegOff(rd));
+                    e.Mov32FromRbx(A.arg2, RegOff(rd));
                     e.CallHelper(b ? HOFF(write8) : HOFF(write32));
                 }
             }
@@ -441,14 +450,14 @@ void CompileFunction(
                 uint32_t off = ((ins >> 6) & 0x1Fu) << 1;
                 uint32_t rb = (ins >> 3) & 7u;
                 uint32_t rd = ins & 7u;
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32FromRbx(Reg::RDX, RegOff(rb));
-                if (off) e.Add32Imm(Reg::RDX, off);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32FromRbx(A.arg1, RegOff(rb));
+                if (off) e.Add32Imm(A.arg1, off);
                 if (l) {
                     e.CallHelper(HOFF(read16Rotated));
                     e.Mov32ToRbx(RegOff(rd), Reg::RAX);
                 } else {
-                    e.Mov32FromRbx(Reg::R8, RegOff(rd));
+                    e.Mov32FromRbx(A.arg2, RegOff(rd));
                     e.CallHelper(HOFF(write16));
                 }
             }
@@ -457,18 +466,18 @@ void CompileFunction(
                 bool l = (ins & (1u << 11)) != 0;
                 uint32_t rd = (ins >> 8) & 7u;
                 uint32_t off = (ins & 0xFFu) << 2;
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32FromRbx(Reg::RDX, RegOff(13));
-                if (off) e.Add32Imm(Reg::RDX, off);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32FromRbx(A.arg1, RegOff(13));
+                if (off) e.Add32Imm(A.arg1, off);
                 if (l) {
                     e.CallHelper(HOFF(read32Rotated));
                     e.Mov32ToRbx(RegOff(rd), Reg::RAX);
                 } else {
-                    e.Mov32FromRbx(Reg::R8, RegOff(rd));
+                    e.Mov32FromRbx(A.arg2, RegOff(rd));
                     e.CallHelper(HOFF(write32));
                 }
             }
-            // Format 12: Load address (ADD Rd, PC/SP, #imm)
+            // Format 12: Load address
             else if ((ins & 0xF000u) == 0xA000u) {
                 bool sp = (ins & (1u << 11)) != 0;
                 uint32_t rd = (ins >> 8) & 7u;
@@ -495,16 +504,16 @@ void CompileFunction(
                 if (l) {
                     for (int i = 0; i < 8; ++i) {
                         if (rlist & (1u << i)) {
-                            e.Mov64(Reg::RCX, Reg::RBX);
-                            e.Mov32FromRbx(Reg::RDX, RegOff(13));
+                            e.Mov64(A.arg0, Reg::RBX);
+                            e.Mov32FromRbx(A.arg1, RegOff(13));
                             e.CallHelper(HOFF(read32));
                             e.Mov32ToRbx(RegOff(static_cast<uint32_t>(i)), Reg::RAX);
                             e.Add32RbxImm(RegOff(13), 4);
                         }
                     }
                     if (pclr) {
-                        e.Mov64(Reg::RCX, Reg::RBX);
-                        e.Mov32FromRbx(Reg::RDX, RegOff(13));
+                        e.Mov64(A.arg0, Reg::RBX);
+                        e.Mov32FromRbx(A.arg1, RegOff(13));
                         e.CallHelper(HOFF(read32));
                         e.And32Imm(Reg::RAX, ~1u);
                         e.Mov32ToRbx(RegOff(15), Reg::RAX);
@@ -519,19 +528,19 @@ void CompileFunction(
                     uint32_t off = 0;
                     for (int i = 0; i < 8; ++i) {
                         if (rlist & (1u << i)) {
-                            e.Mov64(Reg::RCX, Reg::RBX);
-                            e.Mov32FromRbx(Reg::RDX, RegOff(13));
-                            if (off) e.Add32Imm(Reg::RDX, off);
-                            e.Mov32FromRbx(Reg::R8, RegOff(static_cast<uint32_t>(i)));
+                            e.Mov64(A.arg0, Reg::RBX);
+                            e.Mov32FromRbx(A.arg1, RegOff(13));
+                            if (off) e.Add32Imm(A.arg1, off);
+                            e.Mov32FromRbx(A.arg2, RegOff(static_cast<uint32_t>(i)));
                             e.CallHelper(HOFF(write32));
                             off += 4u;
                         }
                     }
                     if (pclr) {
-                        e.Mov64(Reg::RCX, Reg::RBX);
-                        e.Mov32FromRbx(Reg::RDX, RegOff(13));
-                        if (off) e.Add32Imm(Reg::RDX, off);
-                        e.Mov32FromRbx(Reg::R8, RegOff(14));
+                        e.Mov64(A.arg0, Reg::RBX);
+                        e.Mov32FromRbx(A.arg1, RegOff(13));
+                        if (off) e.Add32Imm(A.arg1, off);
+                        e.Mov32FromRbx(A.arg2, RegOff(14));
                         e.CallHelper(HOFF(write32));
                     }
                 }
@@ -539,8 +548,8 @@ void CompileFunction(
             // Format 15: LDMIA / STMIA
             else if ((ins & 0xF000u) == 0xC000u) {
                 e.Mov32ImmToRbx(RegOff(15), nextPc);
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32Imm(Reg::RDX, ins);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32Imm(A.arg1, ins);
                 e.CallHelper(HOFF(execThumb));
                 if ((ins & 0xFFu) == 0) {
                     e.Mov32FromRbx(Reg::RAX, RegOff(15));
@@ -552,8 +561,8 @@ void CompileFunction(
             else if ((ins & 0xFF00u) == 0xDF00u) {
                 uint8_t num = static_cast<uint8_t>(ins & 0xFFu);
                 e.Mov32ImmToRbx(RegOff(15), nextPc);
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32Imm(Reg::RDX, num);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32Imm(A.arg1, num);
                 e.CallHelper(HOFF(execSwi));
                 e.CmpByteRbxZero(gba::CPU_OFF_HALTED);
                 returnTruePatches.push_back(e.JneRel32());
@@ -566,8 +575,8 @@ void CompileFunction(
                 uint32_t cond = (ins >> 8) & 0xFu;
                 int32_t off = SignExt(ins & 0xFFu, 8) << 1;
                 uint32_t target = (pcVal + static_cast<uint32_t>(off)) & ~1u;
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32Imm(Reg::RDX, cond);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32Imm(A.arg1, cond);
                 e.CallHelper(HOFF(checkCond));
                 e.TestEaxEax();
                 size_t skipBranch = e.JeRel32();
@@ -597,12 +606,10 @@ void CompileFunction(
                     emitReturnTrue();
                     continue;
                 }
-            }
-            // Fallback for any other Thumb opcode
-            else {
+            } else {
                 e.Mov32ImmToRbx(RegOff(15), nextPc);
-                e.Mov64(Reg::RCX, Reg::RBX);
-                e.Mov32Imm(Reg::RDX, ins);
+                e.Mov64(A.arg0, Reg::RBX);
+                e.Mov32Imm(A.arg1, ins);
                 e.CallHelper(HOFF(execThumb));
                 e.Mov32FromRbx(Reg::RAX, RegOff(15));
                 e.CmpEaxImm32(nextPc);
@@ -616,18 +623,9 @@ void CompileFunction(
         }
     }
 
-    // Shared return-true epilogue
     size_t retTruePos = e.Pos();
-    e.Mov32Imm(Reg::RAX, 1);
-    e.AddRspImm8(0x20);
-    e.Pop(Reg::R12);
-    e.Pop(Reg::RDI);
-    e.Pop(Reg::RSI);
-    e.Pop(Reg::RBP);
-    e.Pop(Reg::RBX);
-    e.Ret();
+    emitEpilogue(1);
 
-    // Patch all internal labels and return-true jumps
     for (const auto& p : labelPatches) {
         auto it = labelPos.find(p.targetGbaAddr);
         if (it != labelPos.end()) {
@@ -643,7 +641,8 @@ void CompileFunction(
 
 NativeCodegenResult ArmThumbToX64::CompileAll(
     const RomAnalyzer& analyzer,
-    const std::vector<DiscoveredFunction>& funcs
+    const std::vector<DiscoveredFunction>& funcs,
+    X64Abi abi
 ) {
     NativeCodegenResult res;
     res.totalFunctions = static_cast<uint32_t>(funcs.size());
@@ -662,7 +661,7 @@ NativeCodegenResult ArmThumbToX64::CompileAll(
         rec.codeOffset = static_cast<uint32_t>(emitter.Pos());
         rec.isThumb = fn.isThumb ? 1 : 0;
 
-        CompileFunction(emitter, analyzer, fn);
+        CompileFunction(emitter, analyzer, fn, abi);
 
         res.funcRecords.push_back(rec);
         res.totalInstructions += static_cast<uint32_t>(fn.insnAddrs.size());

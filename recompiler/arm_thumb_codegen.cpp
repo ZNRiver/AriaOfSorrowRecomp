@@ -447,7 +447,8 @@ void ArmThumbCodegen::EmitFunction(
     const RomAnalyzer& analyzer,
     const DiscoveredFunction& fn
 ) {
-    out << "bool " << FuncName(fn.entryAddr, fn.isThumb) << "(gba::GbaCpu& cpu) {\n";
+    out << "bool " << FuncName(fn.entryAddr, fn.isThumb) << "(gba::GbaCpu* cpuPtr, const gba::RuntimeHelpers*) {\n";
+    out << "    gba::GbaCpu& cpu = *cpuPtr;\n";
     out << "    switch (cpu.r[15]) {\n";
     for (uint32_t addr : fn.insnAddrs) {
         out << "        case " << Hex32(addr) << ": goto " << LabelName(addr) << ";\n";
@@ -510,7 +511,7 @@ CodegenResult ArmThumbCodegen::GenerateAll(
         out << "#include <algorithm>\n\n";
         out << "namespace gba_recomp {\n";
         for (const auto& fn : funcs) {
-            out << "bool " << FuncName(fn.entryAddr, fn.isThumb) << "(gba::GbaCpu& cpu);\n";
+            out << "bool " << FuncName(fn.entryAddr, fn.isThumb) << "(gba::GbaCpu* cpu, const gba::RuntimeHelpers*);\n";
         }
         out << "} // namespace gba_recomp\n\n";
 

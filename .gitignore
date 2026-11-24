@@ -1,0 +1,31 @@
+# Build artifacts
+build/
+dist/
+out/
+recomp_generated/
+*.obj
+*.o
+*.lib
+*.a
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+
+# GBA ROMs, saves, and runtime config (never commit ROMs!)
+*.gba
+*.bin
+*.sav
+*.ppm
+recomp_config.ini
+imgui.ini
+
+# IDE / OS files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+.DS_Store
+Thumbs.db

@@ -41,6 +41,14 @@ jobs:
         with:
           arch: x64
 
+      - name: Cache CMake/Ninja build directory
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: win-x64-build-${{ hashFiles('CMakeLists.txt', 'runtime/**', 'recompiler/**', 'third_party/imgui/**') }}
+          restore-keys: |
+            win-x64-build-
+
       - name: Configure with CMake + Ninja + Clang
         shell: pwsh
         run: |

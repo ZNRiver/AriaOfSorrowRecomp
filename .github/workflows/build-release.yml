@@ -1,4 +1,4 @@
-name: Build & Release (Windows x64)
+name: Build & Release (Windows & Linux x64)
 
 on:
   push:
@@ -32,13 +32,6 @@ jobs:
           restore-keys: |
             win-x64-build-
 
-      - name: Verify toolchain
-        shell: pwsh
-        run: |
-          cmake --version
-          ninja --version
-          clang++ --version
-
       - name: Configure with CMake + Ninja + Clang
         shell: pwsh
         run: |
@@ -47,11 +40,11 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++ `
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build self-contained recompiler
+      - name: Build self-contained Windows recompiler
         shell: pwsh
         run: cmake --build build --parallel
 
-      - name: Package portable single-exe release bundle
+      - name: Package portable Windows release bundle
         shell: pwsh
         run: |
           $dist = "dist\AriaOfSorrowRecomp-windows-x64"
@@ -61,15 +54,52 @@ jobs:
           Copy-Item "LICENSE" "$dist\"
           Compress-Archive -Path "$dist\*" -DestinationPath "dist\AriaOfSorrowRecomp-windows-x64.zip" -Force
 
-      - name: Upload build artifact
+      - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: AriaOfSorrowRecomp-windows-x64
           path: dist/AriaOfSorrowRecomp-windows-x64.zip
 
-      - name: Create GitHub Release (on tag push)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies (Clang 19+, Ninja, SDL2, OpenGL)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev libgl1-mesa-dev clang
+
+      - name: Cache Linux CMake/Ninja build directory
+        uses: actions/cache@v4
         with:
-          files: dist/AriaOfSorrowRecomp-windows-x64.zip
-          generate_release_notes: true
+          path: build-linux
+          key: linux-x64-build-${{ hashFiles('CMakeLists.txt', 'runtime/**', 'recompiler/**', 'third_party/imgui/**') }}
+          restore-keys: |
+            linux-x64-build-
+
+      - name: Configure with CMake + Ninja + Clang
+        run: |
+          cmake -B build-linux -G Ninja \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build self-contained Linux recompiler
+        run: cmake --build build-linux --parallel
+
+      - name: Package portable Linux release bundle
+        run: |
+          mkdir -p dist/AriaOfSorrowRecomp-linux-x64
+          cp build-linux/recomp-ariaofsorrow dist/AriaOfSorrowRecomp-linux-x64/
+          cp README.md LICENSE dist/AriaOfSorrowRecomp-linux-x64/
+          chmod +x dist/AriaOfSorrowRecomp-linux-x64/recomp-ariaofsorrow
+          tar -czf dist/AriaOfSorrowRecomp-linux-x64.tar.gz -C dist/AriaOfSorrowRecomp-linux-x64 .
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AriaOfSorrowRecomp-linux-x64
+          path: dist/AriaOfSorrowRecomp-linux-x64.tar.gz

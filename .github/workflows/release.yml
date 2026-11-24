@@ -18,8 +18,10 @@ permissions:
   contents: write
 
 jobs:
-  release-windows:
+  build-windows:
     runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
 
     steps:
       - name: Checkout repository
@@ -29,12 +31,8 @@ jobs:
         id: ver
         shell: pwsh
         run: |
-          $raw = "${{ inputs.version }}".Trim()
-          $clean = $raw.TrimStart('v', 'V')
-          $tag = "v$clean"
-          "clean=$clean" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          Write-Host "Release tag: $tag (version $clean)"
+          $clean = "${{ inputs.version }}".Trim().TrimStart('v', 'V')
+          "tag=v$clean" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Setup MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -49,35 +47,86 @@ jobs:
           restore-keys: |
             win-x64-build-
 
-      - name: Configure with CMake + Ninja + Clang
+      - name: Configure & Build Windows
         shell: pwsh
         run: |
-          cmake -B build -G Ninja `
-            -DCMAKE_C_COMPILER=clang `
-            -DCMAKE_CXX_COMPILER=clang++ `
-            -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
 
-      - name: Build self-contained recompiler
-        shell: pwsh
-        run: cmake --build build --parallel
-
-      - name: Package release archive
+      - name: Package Windows release archive
         shell: pwsh
         run: |
           $tag = "${{ steps.ver.outputs.tag }}"
           $dist = "dist\AriaOfSorrowRecomp-$tag-windows-x64"
-          $zipPath = "dist\AriaOfSorrowRecomp-$tag-windows-x64.zip"
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
           Copy-Item "build\recomp-ariaofsorrow.exe" "$dist\"
           Copy-Item "README.md" "$dist\"
           Copy-Item "LICENSE" "$dist\"
-          Compress-Archive -Path "$dist\*" -DestinationPath $zipPath -Force
+          Compress-Archive -Path "$dist\*" -DestinationPath "dist\AriaOfSorrowRecomp-$tag-windows-x64.zip" -Force
+
+      - name: Upload Windows release file
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/AriaOfSorrowRecomp-${{ steps.ver.outputs.tag }}-windows-x64.zip
+
+  build-linux:
+    runs-on: ubuntu-latest
+    needs: build-windows
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev libgl1-mesa-dev clang
+
+      - name: Cache Linux CMake/Ninja build directory
+        uses: actions/cache@v4
+        with:
+          path: build-linux
+          key: linux-x64-build-${{ hashFiles('CMakeLists.txt', 'runtime/**', 'recompiler/**', 'third_party/imgui/**') }}
+          restore-keys: |
+            linux-x64-build-
+
+      - name: Configure & Build Linux
+        run: |
+          cmake -B build-linux -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-linux --parallel
+
+      - name: Package Linux release archive
+        run: |
+          TAG="${{ needs.build-windows.outputs.tag }}"
+          mkdir -p "dist/AriaOfSorrowRecomp-${TAG}-linux-x64"
+          cp build-linux/recomp-ariaofsorrow "dist/AriaOfSorrowRecomp-${TAG}-linux-x64/"
+          cp README.md LICENSE "dist/AriaOfSorrowRecomp-${TAG}-linux-x64/"
+          chmod +x "dist/AriaOfSorrowRecomp-${TAG}-linux-x64/recomp-ariaofsorrow"
+          tar -czf "dist/AriaOfSorrowRecomp-${TAG}-linux-x64.tar.gz" -C "dist/AriaOfSorrowRecomp-${TAG}-linux-x64" .
+
+      - name: Upload Linux release file
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist/AriaOfSorrowRecomp-${{ needs.build-windows.outputs.tag }}-linux-x64.tar.gz
+
+  publish-release:
+    runs-on: ubuntu-latest
+    needs: [ build-windows, build-linux ]
+
+    steps:
+      - name: Download all release archives
+        uses: actions/download-artifact@v4
+        with:
+          path: release_files
+          merge-multiple: true
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          name: AriaOfSorrowRecomp ${{ steps.ver.outputs.tag }}
-          files: dist/AriaOfSorrowRecomp-${{ steps.ver.outputs.tag }}-windows-x64.zip
+          tag_name: ${{ needs.build-windows.outputs.tag }}
+          name: AriaOfSorrowRecomp ${{ needs.build-windows.outputs.tag }}
+          files: release_files/*
           prerelease: ${{ inputs.prerelease }}
           generate_release_notes: true

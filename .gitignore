@@ -1,5 +1,10 @@
 # Build artifacts
 build/
+build-linux/
+build-wasm/
+linux_game/
+wasm_game/
+tools/
 dist/
 out/
 recomp_generated/
